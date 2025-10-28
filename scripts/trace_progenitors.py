@@ -12,9 +12,9 @@ import sys
 import os
 from math import ceil
 
-# # # # # # #
-# Functions #
-# # # # # # #
+# # # # # # # # # # #
+# Halo Chain Object # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# # # # # # # # # # #
 
 class HaloChain():
 
@@ -95,7 +95,8 @@ class HaloChain():
         # Create dictionary of star particle weights to be updated each snapshot. Populate all nmem slots with the starting weight upon initialization
         self.starids = init_starids                                                 # Memory of all star particle IDs -> this array is dynamic
         self.starweights = np.tile(init_starweights[:, np.newaxis], (1, 5))         # Memory of all star particle weights (shape: (nstars, 5)) -> this array is also dynamic
-        self.id_to_idx = {}
+        self.starids_nohalo = None                                                  # If a progenitor cannot be identified, the star particles of the most recent progenitor are saved here
+        self.id_to_idx = {}                                                         # Allows matching star particle IDs to positions in the weight array
         for i, starid in enumerate(init_starids):
             self.id_to_idx[starid] = i
         return
@@ -121,7 +122,10 @@ class HaloChain():
         starids_thishalo = decoder(catalog[str(snap)][halo]['star.ids'][:])
         distances = catalog[str(snap)][halo]['star.distance'][:]
         rvir = catalog[str(snap)][halo]['halo.rvir'][()]
-        starids_thishalo = starids_thishalo[distances <= 0.5*rvir]
+        if sum(distances <= 0.5*rvir) < 5:
+            pass
+        else:
+            starids_thishalo = starids_thishalo[distances <= 0.5*rvir]
         
         nstars = len(starids_thishalo)
         nmatched = sum(np.isin(starids_thishalo, star_ids))
@@ -147,9 +151,37 @@ class HaloChain():
             starids_thishalo = pl.Split(decoder, catalog[str(snap)][halo]['star.ids'][:], self.extracores+1)
         else:
             starids_thishalo = decoder(catalog[str(snap)][halo]['star.ids'][:])
+
+        # Sort star particles to allow matching between lists using array indexing
+        star_ids = np.sort(star_ids)
+        sort_catalog = np.argsort(starids_thishalo)
+        starids_thishalo = starids_thishalo[sort_catalog]
+
+        # Find overlap in star particles and index for each array
         in_thishalo = np.isin(star_ids, starids_thishalo)
+        in_dict = np.isin(starids_thishalo, star_ids)
+
+        # Calculate adjustment weights -> these range from 0.5 at the edge of the virial radius to 1 in the center. These will be multiplied to the summed weights of each star particle
+        halo_rvir = catalog[str(snap)][halo]['halo.rvir'][()]
+        weight_adjustment = 1 - (catalog[str(snap)][halo]['star.distance'][:][sort_catalog][in_dict] / (2*halo_rvir))
+        print(halo, len(weight_adjustment), sum(catalog[str(snap)][halo]['star.distance'][:] < 0.5*halo_rvir), 
+              sum((catalog[str(snap)][halo]['star.distance'][:] < 0.5*halo_rvir) & in_dict), len(starids_thishalo))
+
+        # Find the indices of our overlap stars in the weight array, then sum weights along the snapshot axis (result is has dimensions sum(in_thishalo)).
+        # Multiply the snapshot summed weights by the weight adjustment, then sum once more to get the final chi score
         weight_idxs = np.array([self.id_to_idx[star] for star in star_ids[in_thishalo]])
-        chi = np.sum(self.starweights[weight_idxs, :])
+        weights_snapsummed = np.sum(self.starweights[weight_idxs, :], axis=1)
+        #weight_adjustment = weight_adjustment[weights_snapsummed != max(weights_snapsummed)]
+        #weights_snapsummed = weights_snapsummed[weights_snapsummed != max(weights_snapsummed)]
+        #print(len(weights_snapsummed), np.mean(weights_snapsummed), np.std(weights_snapsummed))
+        #print(np.histogram(weights_snapsummed, bins=20))
+        #print(max(weights_snapsummed))
+        weights_snapsummed *= weight_adjustment
+        #print(np.mean(weight_adjustment), np.std(weight_adjustment))
+        #print(weights_snapsummed * 10000)
+        #print(np.mean(weights_snapsummed))
+        #print(max(weights_snapsummed))
+        chi = np.sum(weights_snapsummed)
         return chi
     
     ### Identifies progenitor at previous snapshot and updates memory
@@ -171,8 +203,8 @@ class HaloChain():
         decoder = np.vectorize(lambda x: x.decode('utf-8'))
 
         ### Get star IDs of interest and their weights
-        star_weights = np.sum(self.starweights, axis=1)   # Take all memory slots into consideration
-        in_mem = star_weights > 0.
+        in_mem = np.sum(self.starweights, axis=1) > 0.   # Take all memory slots into consideration
+        in_recent = self.starweights[:, 0] > 0.   # Take only most recent memory slot into consideration -> used for tracking haloless star particles
         if sum(in_mem) < 5:
             self.state = 'NoStarParticles'
             self.relaxation[idx] = 4
@@ -198,24 +230,18 @@ class HaloChain():
             ## Identify candidate progenitors in the standard case (descendant halo identified in the subsequent snapshot)
             if self.state == 'CandidateHalos':
                 
-                # Strictest check: within 1 dex and at least 60% of constituent star particles are found in the descendant halo -> create filter
+                # Strictest check: within 0.6 dex of previous virial mass, 30% of previous virial radius and at least 60% of constituent star particles are found in the descendant halo
                 relaxation = 0
                 rad_filt = np.abs(np.log10(halos_rvir / self.rvir[idx-1])) < np.log10(2)
-                mass_filt = np.abs(halos_mvir - self.mvir[idx-1]) < 1
+                mass_filt = np.abs(halos_mvir - self.mvir[idx-1]) < 0.6
                 filt = mass_filt & rad_filt
 
                 if sum(filt) == 0:
                     relaxation = 1
                 else:
-                    for halo in halos_id[filt]:
-                        distances_temp = catalog[str(snap)][halo]['star.distance'][:]
-                        rvir_temp = catalog[str(snap)][halo]['halo.rvir'][()]
-                        print(len(catalog[str(snap)][halo]['star.ids'][:]), 
-                            len(catalog[str(snap)][halo]['star.ids'][:][distances_temp < 0.5*rvir_temp]))
                     match_stats = np.array(list(map(lambda halo: self.match_starparticles(catalog, snap, halo, self.starids[in_mem]), halos_id[filt])))
                     halos_nmatched[filt] = match_stats[:, 0]
                     halos_fmatched[filt] = match_stats[:, 1]
-                    print('0')
                     print(halos_id[filt])
                     print(halos_nmatched[filt])
                     print(halos_fmatched[filt])
@@ -234,7 +260,7 @@ class HaloChain():
                         
                     # Relaxed mass and match fraction: within 2 dex and at least 50% of constituent star particles are found in the descendant halo
                     print('*** Relaxing fractional match filter ***')
-                    fraction_filt = (halos_fmatched >= 0.1) & (halos_nmatched >= self.pcut/2)
+                    fraction_filt = (halos_fmatched >= 0.05) & (halos_nmatched >= self.pcut/2)
 
                     if sum(fraction_filt) > 5:
                         halos_check = halos_id[np.argsort(halos_fmatched)[::-1][:5]]
@@ -252,13 +278,13 @@ class HaloChain():
                 if relaxation == 2:
 
                     print('*** Relaxing mass filter ***')
-                    mass_filt_relaxed = (np.abs(halos_mvir - self.mvir[idx-1]) >= 1) & (np.abs(halos_mvir - self.mvir[idx-1]) < 2)
+                    mass_filt_relaxed = (np.abs(halos_mvir - self.mvir[idx-1]) >= 0.5) & (np.abs(halos_mvir - self.mvir[idx-1]) < 1.)
                     filt = mass_filt_relaxed & rad_filt
 
                     if sum(filt) == 0:
                         relaxation = 3
                     else:
-                        match_stats = np.array(list(map(lambda halo: self.match_starparticles(catalog, snap, halo, self.starids[in_mem]), halos_id[mass_filt_relaxed])))
+                        match_stats = np.array(list(map(lambda halo: self.match_starparticles(catalog, snap, halo, self.starids[in_mem]), halos_id[filt])))
                         halos_nmatched[filt] = match_stats[:, 0]
                         halos_fmatched[filt] = match_stats[:, 1]
                         fraction_filt = (halos_fmatched >= 0.10) & (halos_nmatched >= self.pcut/2)
@@ -275,21 +301,29 @@ class HaloChain():
 
                 if relaxation == 3:
                     self.state = 'NoHalos'
+                    self.mvir_last = self.mvir[idx-1]
+                    self.rvir_last = self.rvir[idx-1]
+                    self.starids_nohalo = self.starids[in_recent]
                 else:
                     pass
 
             ## Check for candidate progenitors in the special case (no descendant halo identified in the subsequent snapshot but more than pcut/2 star particles in memory present)
             else:   # self.state = 'NoHalos'
-
-                match_stats = np.array(list(map(lambda halo: self.match_starparticles(catalog, snap, halo, self.starids[in_mem]), halos_id)))
+                
+                # Slightly relaxed filters for re-identifying a progenitor
+                match_stats = np.array(list(map(lambda halo: self.match_starparticles(catalog, snap, halo, self.starids_nohalo), halos_id)))
                 halos_nmatched = match_stats[:, 0]
                 halos_fmatched = match_stats[:, 1]
-                fraction_filt = (halos_fmatched >= 0.1) & (halos_nmatched >= self.pcut/2)
+                fraction_filt = (halos_fmatched >= 0.03) & (halos_nmatched >= self.pcut/2)
 
-                if sum(fraction_filt) > 0:
+                rad_filt = np.abs(np.log10(halos_rvir / self.rvir_last)) < 0.5
+                mass_filt = np.abs(halos_mvir - self.mvir_last) < 1
+                filt = fraction_filt & rad_filt & mass_filt
+
+                if sum(filt) > 0:
                     relaxation = 2
                     self.state = 'CandidateHalos'
-                    halos_check = halos_id[fraction_filt]
+                    halos_check = halos_id[filt]
                 else:
                     relaxation = 3
 
@@ -302,6 +336,7 @@ class HaloChain():
                 chi = np.zeros(len(halos_check))
                 for i, halo in enumerate(halos_check):
                     chi[i] = self.get_chi(catalog, snap, halo, self.starids[in_mem])
+                    print(halo, chi[i])
                 progenitor_id = halos_check[np.argmax(chi)]
                 
                 print(f'*** Progenitor identified (Halo ID: {progenitor_id}) ***')
@@ -311,12 +346,18 @@ class HaloChain():
                 progenitor_position = catalog[str(snap)][progenitor_id]['halo.pos'][:]
                 progenitor_rvir = catalog[str(snap)][progenitor_id]['halo.rvir'][()]
                 progenitor_mvir = np.log10(catalog[str(snap)][progenitor_id]['halo.mvir'][()])
-                progenitor_mstell50 = np.log10(np.sum(catalog[str(snap)][progenitor_id]['star.mass'][distances <= 0.5*progenitor_rvir]))
-                progenitor_mstell100 = np.log10(np.sum(catalog[str(snap)][progenitor_id]['star.mass'][:]))
 
                 # Star particle IDs and weights to be saved to the star particle dictionary
-                progenitor_starids = decoder(catalog[str(snap)][progenitor_id]['star.ids'][distances <= 0.5*progenitor_rvir])
-                progenitor_weights = 1 / distances[distances <= 0.5*progenitor_rvir]**2
+                if sum(distances <= 0.5*progenitor_rvir) < 5:
+                    progenitor_mstell50 = 0.
+                    progenitor_mstell100 = np.log10(np.sum(catalog[str(snap)][progenitor_id]['star.mass'][:]))
+                    progenitor_starids = decoder(catalog[str(snap)][progenitor_id]['star.ids'])
+                    progenitor_weights = 1 / distances**2
+                else:
+                    progenitor_mstell50 = np.log10(np.sum(catalog[str(snap)][progenitor_id]['star.mass'][distances <= 0.5*progenitor_rvir]))
+                    progenitor_mstell100 = np.log10(np.sum(catalog[str(snap)][progenitor_id]['star.mass'][:]))
+                    progenitor_starids = decoder(catalog[str(snap)][progenitor_id]['star.ids'][distances <= 0.5*progenitor_rvir])
+                    progenitor_weights = 1 / distances[distances <= 0.5*progenitor_rvir]**2
                 progenitor_weights /= sum(progenitor_weights)
 
                 # Update relaxation, package data, and return
@@ -447,6 +488,9 @@ class HaloChain():
         
         return
     
+# # # # # # #
+# Functions # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# # # # # # #
 
 def printErrorMessage():
     print()
@@ -536,6 +580,10 @@ def calculate_mainhalo(nhalos, params, snaps, halo_arr=None):
     # Can only calculate as many halos as are present
     if nhalos > len(halo_ids):
         nhalos = len(halo_ids)
+    elif nhalos == 0:
+        nhalos = len(halo_ids)
+    else:
+        pass
 
     # Return an array of -1s for the host halo progenitors if halo_arr is specified and the host halo is not included
     if (halo_arr is not None) and (mainhalo_id not in halo_arr):
@@ -553,8 +601,7 @@ def calculate_mainhalo(nhalos, params, snaps, halo_arr=None):
     if halo_arr is None:
         return nhalos, MainHaloChain.progenitor_id
     else:
-        np.delete(halo_arr, np.where(halo_arr == mainhalo_id)[0][0])
-        return nhalos, halo_arr, MainHaloChain.progenitor_id
+        return nhalos, halo_arr[halo_arr != mainhalo_id], MainHaloChain.progenitor_id
     
 
 def calculate_halos(nhalos, params, snaps, mainhalo_progenitors, halo_arr=None):
@@ -582,6 +629,10 @@ def calculate_halos(nhalos, params, snaps, mainhalo_progenitors, halo_arr=None):
     # To do this, we sort the halos by virial mass. On the first loop, we take the first ncores most massive ones, and on the next loop we take the next ncores most massive ones, etc.
     necessary_loops = ceil(nhalos / ncores)
 
+    print(nhalos, necessary_loops)
+    if halo_arr is not None:
+        print(halo_arr)
+
     for j in range(necessary_loops):
 
         if j == necessary_loops - 1:
@@ -594,6 +645,9 @@ def calculate_halos(nhalos, params, snaps, mainhalo_progenitors, halo_arr=None):
         if halo_arr is not None:
             which_halos = np.where(np.isin(halo_ids, halo_arr))[0]
             which_halos = which_halos[lower:upper]
+            print(halo_ids)
+            print(which_halos)
+            print(halo_ids[which_halos])
         else:
             which_halos = np.argsort(halo_mvir)[::-1][1:][lower:upper]
 
@@ -696,13 +750,14 @@ def merge_files(sim, finder):
     return
 
 # # # # # # # # # # #
-# Main body of code #
+# Main body of code # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 # # # # # # # # # # #
 
 # Retrieve and expand arguments
-#args = ('z5m11a', 'rockstar', 5., np.array(['7791']), 10, 11, 5, 2)
-args = get_args()
+args = ('z5m11a', 'rockstar', 5., np.array(['1944']), 10, 11, 5, 2)
+#args = get_args()
 sim, finder, z0, nhalos, pcut, endsnap, nmem, ncores = args
+print('*** Arguments received successfully ***')
 
 # Open snapshot times data and package parameters for passing into HaloChain functions
 print('*** Accessing data from snapshot_times file... ***')
@@ -716,18 +771,24 @@ params = (sim, z0, startsnap, endsnap, path, finder, nmem, pcut, ncores)        
 
 # Check for input type
 if isinstance(nhalos, np.ndarray):
+
     halo_arr = nhalos
     nhalos = len(halo_arr)
-    input_haloarr = True
-else:
-    input_haloarr = False
-print('*** Arguments received successfully ***')
 
-# Calculate host halo first, followed by all smaller halos in parallel. Merge temporary files into master file when finished
-if input_haloarr:
+    # If included in the list, calculate and save progenitors for the host halo
     nhalos, halo_arr, mainhalo_progenitors = calculate_mainhalo(nhalos, params, snaps, halo_arr=halo_arr)
+    print('mainhalo')
+
+    # Calculate and save progenitors for the rest of the halos
+    print(mainhalo_progenitors)
     calculate_halos(nhalos, params, snaps, mainhalo_progenitors=mainhalo_progenitors, halo_arr=halo_arr)
 else:
+
+    # Calculate and save progenitors for the host halo
     nhalos, mainhalo_progenitors = calculate_mainhalo(nhalos, params, snaps)
+
+    # Calculate and save progenitors forthe rest of the halos
     calculate_halos(nhalos, params, snaps, mainhalo_progenitors=mainhalo_progenitors)
+
+# Merge files for individual halos into one master file for the entire simulation
 #merge_files(sim, finder)

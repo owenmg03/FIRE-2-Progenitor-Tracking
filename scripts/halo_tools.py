@@ -5,7 +5,6 @@
 # This file contains functions that may be useful when working with the FIRE-2 simulations
 
 import numpy as np
-#import numexpr as ne
 import gizmo_analysis as gizmo
 import halo_analysis as halo
 import parallelization as pl

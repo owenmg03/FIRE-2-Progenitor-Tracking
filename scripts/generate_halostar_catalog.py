@@ -1,9 +1,10 @@
 # Owen Gonzales
-# Last modfied: 15 Oct 2025
+# Last modfied: 12 Jan 2026
 
 # For each simulation, this script loops through each snapshot. For each halo in a given snapshot, this program finds all star particles that lie within its
 # virial radius, their masses and distances, and the catalog ID, (x, y, z) position in ckpc, virial radius in ckpc, and virial mass in solar masses. This
-# information is saved to an hdf5 file (one per simulation, structured with a group for each snapshot, and each snapshot with groups for each halo)
+# information is saved to an hdf5 file (one per simulation, structured with a group for each snapshot, and each snapshot with groups for each halo).
+# This data can then be accessed by the trace_progenitors.py file to generate best-progenitor lineages for each halo.
 
 import numpy as np
 import gizmo_analysis as gizmo
@@ -47,6 +48,7 @@ nparticles = 10             # Minimum number of star particles that a halo must 
 for sim in sims:
 
     # Read in snapshot times data
+
     snaptimes = np.loadtxt(f'/projects/b1026/gjsun/high_redshift/{sim}/snapshot_times.txt')
     snaps = snaptimes[11:68, 0][::-1].astype(int)
     zs = snaptimes[11:68, 2][::-1]
@@ -65,7 +67,7 @@ for sim in sims:
             # Read in particle dictionary data
             print('*** Reading in particle dictionary... ***\n')
             part = gizmo.io.Read.read_snapshots('star', 'redshift', z, f'/projects/b1026/gjsun/high_redshift/{sim}')
-            starids, starpos, starmass = ht.unpackAndSortPartDict(part, starID_form='string')[:3]
+            starids, starpos, starmass, starformtime, starformmass = ht.unpackAndSortPartDict(part, starID_form='string')
             starids_utf8 = encoder(starids)
             h = part.Cosmology['hubble']
 
@@ -87,8 +89,10 @@ for sim in sims:
                 distances = np.linalg.norm(starpos[nstar_bool, :] - pos, axis=1)
                 file[str(snap)].create_group(str(ID))
                 file[str(snap)][str(ID)].create_dataset('halo.rvir', data=rad)
-                file[str(snap)][str(ID)].create_dataset('halo.mvir', data=mvir)
+                file[str(snap)][str(ID)].create_dataset('halo.logmvir', data=mvir)
                 file[str(snap)][str(ID)].create_dataset('halo.pos', data=pos)
                 file[str(snap)][str(ID)].create_dataset('star.ids', data=starids_utf8[nstar_bool], dtype=dt)
                 file[str(snap)][str(ID)].create_dataset('star.mass', data=starmass[nstar_bool])
+                file[str(snap)][str(ID)].create_dataset('star.formtime', data=starformtime[nstar_bool])
+                file[str(snap)][str(ID)].create_dataset('star.formmass', data=starformmass[nstar_bool])
                 file[str(snap)][str(ID)].create_dataset('star.distance', data=distances)

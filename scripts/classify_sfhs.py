@@ -37,7 +37,17 @@ def get_namestring(bwidth, avgwidth, bt_lower, bt_upper, qt_string, use_smoothed
 
 
 def smooth_array(arr, width, avgwidth):
+    '''
+    Performs kernel-averaging on an array input to this function, resulting in a smoothed array with the same number of data points.
     
+    Parameters:
+        arr:            array to be averaged
+        width:          spacing between data points in arr (in Myr)
+        avgwidth:       desired kernel width (in Myr)
+    Output:
+        arr_smoothed:   kernel-averaged array
+    '''
+
     # Initialize smoothed array
     arr_smoothed = np.zeros(len(arr))
     
@@ -61,52 +71,80 @@ def smooth_array(arr, width, avgwidth):
     return arr_smoothed
 
 
-def calculate_and_classify_deltasfr(sfh, sfh_smoothed, bt_lower, bt_upper):
-
-    # Code the SFH points based on burstiness, flagging potentially problematic datapoints
-    # Code:
-    # -1: Halo hasn't crossed particle threshold
-    # 0: sfh = 0 and sfh_smoothed = 0
-    # 1: sfh = 0 and sfh_smoothed != 0
-    # 2: 0 < sfh <= bt_lower
-    # 3: bt_lower < sfh <= bt_upper
-    # 4: sfh > bt_upper
+def calculate_and_classify_deltasfr(sfh, sfh_smoothed, isnan, bt_lower, bt_upper):
+    '''
+    Calculates the value of delta_SFR at each time point. Deltasfr measures relative change in SFR between a recent and long term average (default 10 Myr and 100 Myr).
+    Also classifies delta_SFR values with the key below:
+        -1: Halo hasn't crossed particle threshold
+         0: SFR = 0 and smoothed SFR = 0
+         1: SFR = 0 and smoothed SFR != 0
+         2: 0 < SFR <= bt_lower
+         3: bt_lower < SFR <= bt_upper
+         4: SFR > bt_upper
+    
+    Parameters:
+        sfh:                        SFH to classify
+        sfh_smoothed:               kernel-averaged version of sfh
+        isnan:                      boolean array, True when halo has not yet crossed the particle threshold
+        bt_lower:                   lower burst threshold in delta_SFR units
+        bt_upper:                   upper burst threshold in delta_SFR units
+    Output:
+        deltasfr:                   delta_SFR values for each point in the SFR (that has passed the particle threshold)
+        deltasfr_classification:    delta_SFR values classified according to above
+    '''
     
     # Keep track of nan values -> these will be included in deltasfr as nan and in deltasfr_classification as -1
     deltasfr = np.log10(sfh / sfh_smoothed)
     deltasfr_classification = -np.ones(len(sfh))
     
     # Keep track of various values of interest
-    isnan = np.isnan(sfh)
     is0 = sfh == 0.
     is0_smoothed = sfh_smoothed == 0.
     
     deltasfr[is0 & is0_smoothed] = -np.inf
     deltasfr[is0 & ~is0_smoothed] = -2
     deltasfr[~(is0 & is0_smoothed) & (deltasfr < -2)] = -2   # Set a floor value for all points below deltasfr = -2
+    deltasfr[isnan] = np.nan
     
     deltasfr_classification[is0 & is0_smoothed] = 0
     deltasfr_classification[is0 & ~is0_smoothed] = 1
     deltasfr_classification[~is0 & ~isnan & (deltasfr <= bt_lower)] = 2
     deltasfr_classification[(deltasfr > bt_lower) & (deltasfr < bt_upper)] = 3
     deltasfr_classification[deltasfr >= bt_upper] = 4
+    deltasfr_classification[isnan] = -1
     
     return deltasfr, deltasfr_classification
 
 
-def find_bursts(time, deltasfr, deltasfr_classification, bwidth):
+def find_bursts(time, ssfr, bt_ssfr, deltasfr, deltasfr_classification, bwidth):
+    '''
+    Locates burst events in the SFR of a single halo using a combination of sSFR and delta_SFR criteria. Uses an adaptive scheme with upper and lower burst thesholds
+    to capture the entirety of burst events.
+    
+    Parameters:
+        time:                       time (Myr)
+        ssfr:                       halo sSFR
+        bt_ssfr:                    minimum sSFR value for a point to be considered a burst
+        deltasfr:                   array of delta_SFR values for each time point
+        deltasfr_classification:    classified delta_SFR values (see description of calculate_and_classify_deltasfr)
+        bwidth:                     bin width for SFH histogram (Myr)
+    Output:
+        isburst:                    boolean array of len(time). True when a data point is identified as a burst
+        burst_timesmags:            array of tuples containing (start of burst (Myr), end of burst (Myr), average magnitude of burst (delta_SFR units))
+    '''
 
-    # This block identifies the locations of bursts in our SFHs using the SFH code
-    # We start by identifying all points where sfhcode = 4, meaning deltaSFH lies above the burst threshold
-    # We then widen the boolean to include points on either side of already identified bursts by sliding it 
-    # one block to either side a performing an | operation. This necessitates the dummy elements
-    # We repeat this until diff = 0, where diff measures how many new points we gained doing the sliding operation
+    # To be a burst, points must have an above average sSFR. We chose a value of 10^-8.2 by default
+    # Created widened classification and isburst arrays
+    # Burst locations are where both the sSFR and the delta_SFR are sufficiently high.
+    is_ssfr_thresh = ssfr >= bt_ssfr
     classification_dummy = np.zeros(len(deltasfr_classification)+2)
     classification_dummy[1:-1] = deltasfr_classification
     isburst = np.zeros(len(deltasfr_classification)+2).astype(bool)
-    isburst[1:-1] = deltasfr_classification == 4
+    isburst[1:-1] = (deltasfr_classification == 4) & is_ssfr_thresh
 
-    # <diff> indicates whether or not we have gained burst points by widening the window one time bin in each direction
+    # Look at points to the left and right of all points identified as burst locations. If any have a delta_SFR classification of 3 or 4, they are
+    # also part of the burst. Iterate this process until no new points are gained.
+    # <diff> indicates whether or not we have gained burst points by widening the window one time bin in either direction
     diff = 1
     while diff > 0:
         widen_isburst = (isburst | np.roll(isburst, 1) | np.roll(isburst, -1))
@@ -159,14 +197,27 @@ def find_bursts(time, deltasfr, deltasfr_classification, bwidth):
     return isburst, burst_timesmags
 
 
-def find_quenches(time, ssfr_smoothed, bwidth, quench_threshold, quench_duration):
+def find_quenches(time, ssfr, quench_threshold, quench_duration, bwidth):
+    '''
+    Locates quench events in the SFR of a single halo using an sSFR criterion. Quench events have a minimum duration. 
+    
+    Parameters:
+        time:                       time (Myr)
+        ssfr:                       halo sSFR
+        quench_threshold:           maximum sSFR value for a point to be considered a quench (yr^-1)
+        quench_duration:            minimum length of a quench event (Myr)
+        bwidth:                     bin width for SFH histogram (Myr)
+    Output:
+        isburst:                    boolean array of len(time). True when a data point is identified as a burst
+        burst_timesmags:            array of tuples containing (start of burst (Myr), end of burst (Myr), average magnitude of burst (delta_SFR units))
+    '''
 
     # Minimum number of timesteps to be considered a burst
     bwidth_gyr = bwidth / 1e3
     quench_mintimesteps = ceil(quench_duration / bwidth)
 
     # Points beneath the quench threshold are quenched
-    isquench_prelim = ssfr_smoothed < quench_threshold
+    isquench_prelim = ssfr < quench_threshold
     isquench = np.zeros(len(isquench_prelim)).astype(bool)
     quench_times = []
 
@@ -208,9 +259,33 @@ def find_quenches(time, ssfr_smoothed, bwidth, quench_threshold, quench_duration
 
 
 def create_bq_file(sim, params):
+    '''
+    Generates .hdf5 file containing (in-situ and total) SFHs, sSFHs, and delta_SFR values for each halo in a simulation.
+    This file also locates burst and quench events and saves their locations in both a boolean array (for use with other data) and a tuple containing the
+    start and end time of the event. For bursts, the average magnitude of the burst is also recorded.
 
+    Parameters:
+        sim:                        simulation to analyze
+        params:
+            bwidth:                 bin width of SFH histogram
+            avgwidth:               kernel width for smoothing the SFH
+            particle_threshold:     minimum number of star particles for a halo's data to be useful
+            burst_thresholds:
+                bt_lower:           lower burst threshold
+                bt_upper:           upper burst theshold
+                bt_ssfr:            minimum sSFR value a burst must have
+            quench_thesholds:
+                qt_ssfr:            maximum sSFR value a quench threshold can have
+                qt_string:          rounded string of quench threshold for use in file name
+            quench_duration:        minimum duration a quench event can have
+            use_smoothed:           if True, uses the smoothed sSFR to determine quenched status. Otherwise, uses the standard sSFR.
+    Output:
+
+    '''
     # Unpack parameters and get namestring
-    bwidth, avgwidth, particle_threshold, bt_lower, bt_upper, (quench_threshold, qt_string), quench_duration, use_smoothed = params
+    bwidth, avgwidth, particle_threshold, burst_thresholds, quench_thresholds, quench_duration, use_smoothed = params
+    bt_lower, bt_upper, bt_ssfr = burst_thresholds
+    qt_ssfr, qt_string = quench_thresholds
     namestring = get_namestring(bwidth, avgwidth, bt_lower, bt_upper, qt_string, use_smoothed, particle_threshold)
     
     # Read in halos at snapshot <startsnap>
@@ -230,6 +305,7 @@ def create_bq_file(sim, params):
                 sfh_total = sfhfile[halo]['sfh.total50'][:]
                 sfh_insitu = sfhfile[halo]['sfh.insitu50'][:]
                 mstell_interp = sfhfile[halo]['mstell.interp50'][:]
+                isnan = np.isnan(mstell_interp)
 
             # Smooth SFH
             sfh_total_smoothed = smooth_array(sfh_total, bwidth, avgwidth)
@@ -242,20 +318,25 @@ def create_bq_file(sim, params):
             ssfh_insitu_smoothed = sfh_insitu_smoothed / mstell_interp
             
             # Classify deltasfr points 
-            deltasfr_total, deltasfr_total_classification = calculate_and_classify_deltasfr(sfh_total, sfh_total_smoothed, bt_lower, bt_upper)
-            deltasfr_insitu, deltasfr_insitu_classification = calculate_and_classify_deltasfr(sfh_insitu, sfh_insitu_smoothed, bt_lower, bt_upper)
+            deltasfr_total, deltasfr_total_classification = calculate_and_classify_deltasfr(sfh_total, sfh_total_smoothed, isnan, bt_lower, bt_upper)
+            deltasfr_insitu, deltasfr_insitu_classification = calculate_and_classify_deltasfr(sfh_insitu, sfh_insitu_smoothed, isnan, bt_lower, bt_upper)
 
-            # Identify bursts, their durations, and average magnitudes
-            isburst_total, burst_timesmags_total = find_bursts(time, deltasfr_total, deltasfr_total_classification, bwidth)
-            isburst_insitu, burst_timesmags_insitu = find_bursts(time, deltasfr_insitu, deltasfr_insitu_classification, bwidth)
-
-            # Identify mini-quenches and their durations
             if use_smoothed:
-                isquench_total, quench_times_total = find_quenches(time, ssfh_total_smoothed, bwidth, quench_threshold, quench_duration)
-                isquench_insitu, quench_times_insitu = find_quenches(time, ssfh_insitu_smoothed, bwidth, quench_threshold, quench_duration)
+                # Identify bursts, their durations, and average magnitudes using time-averaged ssfh
+                isburst_total, burst_timesmags_total = find_bursts(time, ssfh_total_smoothed, bt_ssfr, deltasfr_total, deltasfr_total_classification, bwidth)
+                isburst_insitu, burst_timesmags_insitu = find_bursts(time, ssfh_total_smoothed, bt_ssfr, deltasfr_insitu, deltasfr_insitu_classification, bwidth)
+
+                # Identify mini-quenches and their durations using time-averaged ssfh
+                isquench_total, quench_times_total = find_quenches(time, ssfh_total_smoothed, qt_ssfr, quench_duration, bwidth)
+                isquench_insitu, quench_times_insitu = find_quenches(time, ssfh_insitu_smoothed, qt_ssfr, quench_duration, bwidth)
             else:
-                isquench_total, quench_times_total = find_quenches(time, ssfh_total, bwidth, quench_threshold, quench_duration)
-                isquench_insitu, quench_times_insitu = find_quenches(time, ssfh_insitu, bwidth, quench_threshold, quench_duration)
+                # Identify mini-quenches and their durations using regular ssfh
+                isburst_total, burst_timesmags_total = find_bursts(time, ssfh_total, bt_ssfr, deltasfr_total, deltasfr_total_classification, bwidth)
+                isburst_insitu, burst_timesmags_insitu = find_bursts(time, ssfh_total, bt_ssfr, deltasfr_insitu, deltasfr_insitu_classification, bwidth)
+
+                # Identify bursts, their durations, and average magnitudes using regular ssfh
+                isquench_total, quench_times_total = find_quenches(time, ssfh_total, qt_ssfr, quench_duration, bwidth)
+                isquench_insitu, quench_times_insitu = find_quenches(time, ssfh_insitu, qt_ssfr, quench_duration, bwidth)
 
             # Save to hdf5 file
             statfile.create_group(halo)
@@ -296,12 +377,17 @@ sims = ['z5m11a', 'z5m11b', 'z5m11c', 'z5m11d', 'z5m11e', 'z5m11f', 'z5m11g', \
 bwidth = 10
 avgwidth = 100
 particle_threshold = 10
-bt_lower = 0.2
+bt_lower = 0.1
 bt_upper = 0.5
-quench_threshold = (3e-10, '3e-10')
+bt_ssfr = 6.3e-9   # ~10^-8.2
+qt_ssfr = 3e-10   # ~10^-9.5
+qt_string = '3e-10'
 quench_duration = 30
 use_smoothed = False
-params = (bwidth, avgwidth, particle_threshold, bt_lower, bt_upper, quench_threshold, quench_duration, use_smoothed)
+
+burst_thresholds = (bt_lower, bt_upper, bt_ssfr)
+quench_thresholds = (qt_ssfr, qt_string)
+params = (bwidth, avgwidth, particle_threshold, burst_thresholds, quench_thresholds, quench_duration, use_smoothed)
 
 #tbins = [0.268996271, 0.544257711, 0.835479993, 1.169487934]   # zbins = [15, 9, 6.5, 5]
 
@@ -311,4 +397,3 @@ for sim in sims[0:9]:
     
     print(sim)
     create_bq_file(sim, params)
-    print()
